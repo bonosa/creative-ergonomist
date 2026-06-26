@@ -12,6 +12,10 @@ const WASM_URL =
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
+// --- Alert tuning ---------------------------------------------------
+const POSTURE_DROP_ALERT = 8; // warn when score falls this many points below your recent best (~5–10%)
+const WARN_REPEAT_MS = 60_000; // repeat the slouch warning every 1 min while uncorrected
+
 const CSS = `
 * { box-sizing: border-box; }
 .ce-root {
@@ -128,7 +132,129 @@ input[type="range"]::-moz-range-thumb {
 
 .ce-bars { margin-top: 16px; display: flex; align-items: flex-end; gap: 4px; height: 48px; }
 .ce-bar { flex: 1; border-radius: 2px; min-height: 4px; transition: height .2s; }
+
+.ce-rem-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 16px; font-size: 13px; }
+.ce-rem-edit { display: inline-flex; align-items: center; gap: 6px; color: rgba(255,255,255,.5); font-size: 12px; }
+.ce-rem-edit input {
+  width: 52px; padding: 6px 8px; text-align: center;
+  border: 1px solid rgba(255,255,255,.12); border-radius: 8px;
+  background: rgba(255,255,255,.06); color: #fff; font-size: 13px;
+}
+.ce-rem-text {
+  width: 100%; margin-top: 8px; padding: 8px 10px;
+  border: 1px solid rgba(255,255,255,.1); border-radius: 8px;
+  background: rgba(255,255,255,.04); color: #fff; font-size: 12px;
+}
+.ce-rem-text::placeholder { color: rgba(255,255,255,.3); }
+
+/* --- Compact always-on-top widget mode --- */
+.ce-root.widget { padding: 6px; min-height: 100vh; }
+.ce-root.widget .ce-header { display: none; }
+.ce-root.widget .ce-grid { grid-template-columns: 1fr; gap: 0; max-width: none; }
+.ce-root.widget .ce-grid > .ce-stack { display: none; }
+.ce-root.widget .ce-stage { border: none; border-radius: 10px; padding: 0; }
+.ce-root.widget .ce-badge { display: none; }
+.ce-root.widget .ce-screen { max-width: none; max-height: none; height: 100vh; border-radius: 10px; }
+.ce-root.widget .ce-status { display: none; }
+
+.ce-widget-bar {
+  position: absolute; top: 8px; left: 8px; right: 8px; z-index: 20;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: 10px;
+  background: rgba(0,0,0,.55); backdrop-filter: blur(4px);
+}
+.ce-widget-score { font-size: 22px; font-weight: 600; line-height: 1; }
+.ce-widget-label { font-size: 12px; font-weight: 500; flex: 1; }
+.ce-widget-exit {
+  border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.08);
+  color: #fff; border-radius: 8px; width: 28px; height: 28px;
+  font-size: 14px; cursor: pointer; line-height: 1;
+}
+.ce-widget-exit:hover { background: rgba(255,255,255,.16); }
 `;
+
+// --- Audio alerts ---------------------------------------------------
+// One shared AudioContext for the beep; created lazily on first use so the
+// browser's autoplay policy is satisfied (Start Monitoring is the user gesture).
+let audioCtx: AudioContext | null = null;
+function beep(freq = 660, ms = 200) {
+  try {
+    audioCtx ??= new (window.AudioContext ||
+      (window as any).webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    const t = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.25, t + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + ms / 1000);
+  } catch {
+    /* audio unavailable */
+  }
+}
+function speak(text: string) {
+  try {
+    if (!("speechSynthesis" in window)) return;
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1;
+    u.pitch = 1;
+    u.volume = 1;
+    window.speechSynthesis.speak(u);
+  } catch {
+    /* speech unavailable */
+  }
+}
+function notify(spoken: string, osTitle?: string) {
+  beep();
+  speak(spoken);
+  if (osTitle) notifyOS(osTitle, spoken);
+}
+
+// --- OS desktop notifications --------------------------------------
+function requestNotifyPermission() {
+  try {
+    if ("Notification" in window && Notification.permission === "default") {
+      Notification.requestPermission();
+    }
+  } catch {
+    /* notifications unavailable */
+  }
+}
+function notifyOS(title: string, body: string) {
+  try {
+    if (!("Notification" in window) || Notification.permission !== "granted")
+      return;
+    new Notification(title, {
+      body,
+      tag: "creative-ergonomist",
+      // @ts-expect-error renotify is valid but missing from some TS lib defs
+      renotify: true,
+    });
+  } catch {
+    /* notifications unavailable */
+  }
+}
+
+// Switch the OS window into / out of a small always-on-top widget. No-op in the
+// browser build. Always-on-top keeps the webview visible so pose detection
+// (which a browser pauses when a window is hidden) keeps running while you work.
+async function setWidgetWindow(on: boolean) {
+  if (!(window as any).__TAURI_INTERNALS__) return;
+  try {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    const { LogicalSize } = await import("@tauri-apps/api/dpi");
+    const w = getCurrentWindow();
+    await w.setAlwaysOnTop(on);
+    await w.setSize(on ? new LogicalSize(360, 300) : new LogicalSize(1280, 800));
+  } catch {
+    /* window API unavailable */
+  }
+}
 
 export default function App() {
   const [monitoring, setMonitoring] = useState(false);
@@ -138,6 +264,11 @@ export default function App() {
   const [color, setColor] = useState("#34d399");
   const [history, setHistory] = useState<number[]>(Array(24).fill(0));
   const [status, setStatus] = useState("Idle");
+  const [alertsOn, setAlertsOn] = useState(true);
+  const [medHours, setMedHours] = useState(3);
+  const [walkHours, setWalkHours] = useState(2);
+  const [medLabel, setMedLabel] = useState("your medication");
+  const [widget, setWidget] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -150,6 +281,11 @@ export default function App() {
   const calibrate = useRef(false);
   const sensRef = useRef(sensitivity);
   sensRef.current = sensitivity;
+  const alertsRef = useRef(alertsOn);
+  alertsRef.current = alertsOn;
+  const goodRef = useRef(100); // rolling "recent best" score to measure drops against
+  const slouchingRef = useRef(false);
+  const lastWarnRef = useRef(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -267,6 +403,10 @@ export default function App() {
         baseline.current = neck;
         calibrate.current = false;
         setStatus("Baseline calibrated");
+        // fresh baseline = fresh reference, clear any active warning
+        goodRef.current = 100;
+        slouchingRef.current = false;
+        lastWarnRef.current = 0;
       }
       const base = baseline.current ?? 0.55;
       // Forward-neck slump is the real ergonomic signal. Ignore tiny deviations
@@ -286,6 +426,25 @@ export default function App() {
       else if (s < 85) { l = "Minor Drift"; c = "#fbbf24"; }
       setScore(s); setLabel(l); setColor(c);
       setHistory((h) => [...h.slice(1), s]);
+
+      // --- Posture-deterioration alert ---
+      // Track a rolling "recent best"; a long slouch drifts it down only very
+      // slowly so warnings keep firing while you stay slumped.
+      if (s > goodRef.current) goodRef.current = s;
+      else goodRef.current = goodRef.current * 0.999 + s * 0.001;
+      const drop = goodRef.current - s;
+      if (alertsRef.current) {
+        const now = performance.now();
+        if (drop >= POSTURE_DROP_ALERT) {
+          if (!slouchingRef.current || now - lastWarnRef.current >= WARN_REPEAT_MS) {
+            notify("Slouching!", "Posture alert");
+            lastWarnRef.current = now;
+          }
+          slouchingRef.current = true;
+        } else if (drop <= POSTURE_DROP_ALERT / 2) {
+          slouchingRef.current = false; // corrected (hysteresis avoids chatter)
+        }
+      }
     }
 
     if (monitoring) start();
@@ -301,11 +460,41 @@ export default function App() {
     };
   }, [monitoring]);
 
+  // Timed wellness reminders, active only while monitoring + alerts are on.
+  useEffect(() => {
+    if (!monitoring || !alertsOn) return;
+    const timers: number[] = [];
+    if (medHours > 0) {
+      timers.push(
+        window.setInterval(
+          () =>
+            notify(`Reminder: time to take ${medLabel}.`, "Medication reminder"),
+          medHours * 60 * 60 * 1000
+        )
+      );
+    }
+    if (walkHours > 0) {
+      timers.push(
+        window.setInterval(
+          () =>
+            notify("Reminder: time to get up and walk around.", "Walk break"),
+          walkHours * 60 * 60 * 1000
+        )
+      );
+    }
+    return () => timers.forEach(clearInterval);
+  }, [monitoring, alertsOn, medHours, walkHours, medLabel]);
+
+  // Drive the OS window in/out of compact always-on-top widget mode.
+  useEffect(() => {
+    setWidgetWindow(widget);
+  }, [widget]);
+
   const R = 52;
   const C = 2 * Math.PI * R;
 
   return (
-    <div className="ce-root">
+    <div className={`ce-root${widget ? " widget" : ""}`}>
       <style>{CSS}</style>
 
       <div className="ce-header">
@@ -327,6 +516,74 @@ export default function App() {
             >
               📷 Calibrate Base
             </button>
+            <button
+              className="ce-btn ce-btn-row"
+              onClick={() =>
+                setAlertsOn((o) => {
+                  const next = !o;
+                  if (next) {
+                    requestNotifyPermission();
+                    notify("Voice alerts on.");
+                  }
+                  return next;
+                })
+              }
+            >
+              {alertsOn ? "🔊 Voice Alerts: On" : "🔇 Voice Alerts: Off"}
+            </button>
+            <button
+              className="ce-btn ce-btn-row"
+              onClick={() => setWidget(true)}
+            >
+              🪟 Widget Mode
+            </button>
+            <p className="ce-hint">
+              Says “Slouching!” when posture drops ~{POSTURE_DROP_ALERT}%,
+              repeating every minute until corrected.
+            </p>
+          </div>
+
+          <div className="ce-card">
+            <p className="ce-label">Reminders</p>
+            <label className="ce-rem-row">
+              <span>💊 {medLabel}</span>
+              <span className="ce-rem-edit">
+                every
+                <input
+                  type="number"
+                  min={0}
+                  step={0.5}
+                  value={medHours}
+                  onChange={(e) => setMedHours(Number(e.target.value))}
+                />
+                h
+              </span>
+            </label>
+            <input
+              type="text"
+              className="ce-rem-text"
+              value={medLabel}
+              onChange={(e) => setMedLabel(e.target.value || "your medication")}
+              placeholder="e.g. your blood pressure pill"
+            />
+            <label className="ce-rem-row" style={{ marginTop: 12 }}>
+              <span>🚶 Walk break</span>
+              <span className="ce-rem-edit">
+                every
+                <input
+                  type="number"
+                  min={0}
+                  step={0.5}
+                  value={walkHours}
+                  onChange={(e) => setWalkHours(Number(e.target.value))}
+                />
+                h
+              </span>
+            </label>
+            <p className="ce-hint">
+              Set to 0 to turn a reminder off. Timer starts when monitoring
+              begins.
+            </p>
           </div>
 
           <div className="ce-card">
@@ -349,7 +606,12 @@ export default function App() {
 
           <button
             className={`ce-toggle ${monitoring ? "stop" : "start"}`}
-            onClick={() => setMonitoring((m) => !m)}
+            onClick={() =>
+              setMonitoring((m) => {
+                if (!m) requestNotifyPermission();
+                return !m;
+              })
+            }
           >
             {monitoring ? "Stop Monitoring" : "Start Monitoring"}
           </button>
@@ -374,6 +636,23 @@ export default function App() {
               status !== "Tracking" && <div className="ce-overlay">{status}</div>
             )}
             <div className="ce-status">{status}</div>
+            {widget && (
+              <div className="ce-widget-bar">
+                <span className="ce-widget-score" style={{ color }}>
+                  {score}
+                </span>
+                <span className="ce-widget-label" style={{ color }}>
+                  {label}
+                </span>
+                <button
+                  className="ce-widget-exit"
+                  title="Exit widget mode"
+                  onClick={() => setWidget(false)}
+                >
+                  ⤢
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
