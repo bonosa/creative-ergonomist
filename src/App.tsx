@@ -13,43 +13,43 @@ const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
 
 // --- Alert tuning ---------------------------------------------------
-const POSTURE_DROP_ALERT = 8; // warn when score falls this many points below your recent best (~5–10%)
-const WARN_REPEAT_MS = 60_000; // repeat the slouch warning every 1 min while uncorrected
+const SLOUCH_BELOW = 85; // say "Slouching!" when score drops below this (ring leaves green)
+const WARN_REPEAT_MS = 60_000; // minimum gap between spoken warnings (1 min)
 
 const CSS = `
 * { box-sizing: border-box; }
 .ce-root {
   min-height: 100vh;
-  padding: 24px;
+  padding: 14px;
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   color: #fff;
 }
-.ce-header { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+.ce-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
 .ce-logo {
-  width: 36px; height: 36px; border-radius: 10px;
-  display: flex; align-items: center; justify-content: center; font-size: 18px;
+  width: 32px; height: 32px; border-radius: 10px;
+  display: flex; align-items: center; justify-content: center; font-size: 16px;
   background: linear-gradient(135deg, #d946ef, #7c3aed);
 }
 .ce-title { font-size: 14px; font-weight: 700; margin: 0; }
 .ce-sub { font-size: 12px; color: rgba(255,255,255,.4); margin: 0; }
 
 .ce-grid {
-  display: grid; gap: 20px; max-width: 1500px; margin: 0 auto;
-  grid-template-columns: 300px 1fr 300px;
+  display: grid; gap: 12px; max-width: 1500px; margin: 0 auto;
+  grid-template-columns: 280px 1fr 280px;
 }
 @media (max-width: 1100px) { .ce-grid { grid-template-columns: 1fr; } }
 
 .ce-card {
   border: 1px solid rgba(255,255,255,.06);
   background: rgba(255,255,255,.03);
-  border-radius: 16px;
-  padding: 20px;
+  border-radius: 14px;
+  padding: 14px;
 }
 .ce-label {
   font-size: 11px; font-weight: 600; text-transform: uppercase;
   letter-spacing: .15em; color: rgba(255,255,255,.4); margin: 0;
 }
-.ce-stack > * + * { margin-top: 16px; }
+.ce-stack > * + * { margin-top: 12px; }
 
 .ce-btn {
   width: 100%; border: 1px solid rgba(255,255,255,.1);
@@ -89,16 +89,16 @@ input[type="range"]::-moz-range-thumb {
 
 .ce-stage {
   position: relative; border: 1px solid rgba(255,255,255,.06);
-  background: rgba(0,0,0,.4); border-radius: 16px; padding: 16px;
+  background: rgba(0,0,0,.4); border-radius: 14px; padding: 10px;
 }
 .ce-badge {
-  position: absolute; top: 28px; left: 28px; z-index: 10;
+  position: absolute; top: 20px; left: 20px; z-index: 10;
   border: 1px solid rgba(234,179,8,.3); background: rgba(234,179,8,.1);
   color: #facc15; border-radius: 6px; padding: 4px 8px;
   font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .15em;
 }
 .ce-screen {
-  width: 100%; max-width: 760px; aspect-ratio: 4 / 3; max-height: 70vh;
+  width: 100%; max-width: 620px; aspect-ratio: 4 / 3; max-height: 50vh;
   margin: 0 auto; overflow: hidden;
   border-radius: 12px; position: relative;
   background:
@@ -166,11 +166,12 @@ input[type="range"]::-moz-range-thumb {
 .ce-widget-score { font-size: 22px; font-weight: 600; line-height: 1; }
 .ce-widget-label { font-size: 12px; font-weight: 500; flex: 1; }
 .ce-widget-exit {
-  border: 1px solid rgba(255,255,255,.15); background: rgba(255,255,255,.08);
-  color: #fff; border-radius: 8px; width: 28px; height: 28px;
-  font-size: 14px; cursor: pointer; line-height: 1;
+  border: none; background: #ef4444; color: #fff;
+  border-radius: 8px; padding: 0 12px; height: 32px;
+  font-size: 13px; font-weight: 700; cursor: pointer; line-height: 1;
+  white-space: nowrap;
 }
-.ce-widget-exit:hover { background: rgba(255,255,255,.16); }
+.ce-widget-exit:hover { background: #dc2626; }
 `;
 
 // --- Audio alerts ---------------------------------------------------
@@ -283,8 +284,6 @@ export default function App() {
   sensRef.current = sensitivity;
   const alertsRef = useRef(alertsOn);
   alertsRef.current = alertsOn;
-  const goodRef = useRef(100); // rolling "recent best" score to measure drops against
-  const slouchingRef = useRef(false);
   const lastWarnRef = useRef(0);
 
   useEffect(() => {
@@ -403,9 +402,7 @@ export default function App() {
         baseline.current = neck;
         calibrate.current = false;
         setStatus("Baseline calibrated");
-        // fresh baseline = fresh reference, clear any active warning
-        goodRef.current = 100;
-        slouchingRef.current = false;
+        // fresh baseline = clear any active warning cooldown
         lastWarnRef.current = 0;
       }
       const base = baseline.current ?? 0.55;
@@ -428,21 +425,14 @@ export default function App() {
       setHistory((h) => [...h.slice(1), s]);
 
       // --- Posture-deterioration alert ---
-      // Track a rolling "recent best"; a long slouch drifts it down only very
-      // slowly so warnings keep firing while you stay slumped.
-      if (s > goodRef.current) goodRef.current = s;
-      else goodRef.current = goodRef.current * 0.999 + s * 0.001;
-      const drop = goodRef.current - s;
-      if (alertsRef.current) {
+      // Fire when the ring leaves the green zone (score below SLOUCH_BELOW), but
+      // never more than once per WARN_REPEAT_MS — the cooldown applies whether
+      // it's the same slouch continuing or a brand-new one.
+      if (alertsRef.current && s < SLOUCH_BELOW) {
         const now = performance.now();
-        if (drop >= POSTURE_DROP_ALERT) {
-          if (!slouchingRef.current || now - lastWarnRef.current >= WARN_REPEAT_MS) {
-            notify("Slouching!", "Posture alert");
-            lastWarnRef.current = now;
-          }
-          slouchingRef.current = true;
-        } else if (drop <= POSTURE_DROP_ALERT / 2) {
-          slouchingRef.current = false; // corrected (hysteresis avoids chatter)
+        if (now - lastWarnRef.current >= WARN_REPEAT_MS) {
+          notify("Slouching!", "Posture alert");
+          lastWarnRef.current = now;
         }
       }
     }
@@ -538,8 +528,8 @@ export default function App() {
               🪟 Widget Mode
             </button>
             <p className="ce-hint">
-              Says “Slouching!” when posture drops ~{POSTURE_DROP_ALERT}%,
-              repeating every minute until corrected.
+              Says “Slouching!” whenever the score leaves the green zone (below
+              {" "}{SLOUCH_BELOW}), repeating every minute until corrected.
             </p>
           </div>
 
@@ -649,7 +639,7 @@ export default function App() {
                   title="Exit widget mode"
                   onClick={() => setWidget(false)}
                 >
-                  ⤢
+                  ✕ Exit
                 </button>
               </div>
             )}
