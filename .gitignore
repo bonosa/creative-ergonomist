@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+
+# Build output
+dist/
+build/
+*.egg-info/
+.next/
+out/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+
+# Misc
+.cache/
+coverage/

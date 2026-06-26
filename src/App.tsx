@@ -269,11 +269,15 @@ export default function App() {
         setStatus("Baseline calibrated");
       }
       const base = baseline.current ?? 0.55;
-      const slump = clamp((base - neck) / base, 0, 1);
-      const tilt = clamp(Math.abs(le.y - re.y) / sw / 0.3, 0, 1);
-      const lean = clamp(Math.abs(ls.y - rs.y) / sw / 0.3, 0, 1);
+      // Forward-neck slump is the real ergonomic signal. Ignore tiny deviations
+      // (8% deadzone) and require a big drop before it saturates.
+      const slump = clamp(((base - neck) / base - 0.08) / 0.5, 0, 1);
+      // Head tilt & shoulder lean: generous deadzone so natural asymmetry and a
+      // non-level webcam don't register as "drift", and a much gentler scale.
+      const tilt = clamp((Math.abs(le.y - re.y) / sw - 0.08) / 0.5, 0, 1);
+      const lean = clamp((Math.abs(ls.y - rs.y) / sw - 0.08) / 0.5, 0, 1);
       const penalty =
-        (slump * 0.6 + tilt * 0.2 + lean * 0.2) * 100 * (sensRef.current / 50);
+        (slump * 0.7 + tilt * 0.15 + lean * 0.15) * 100 * (sensRef.current / 50);
       const raw = clamp(100 - penalty, 0, 100);
       smoothed.current = smoothed.current * 0.8 + raw * 0.2;
       const s = Math.round(smoothed.current);
